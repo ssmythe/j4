@@ -97,7 +97,9 @@ is_p4port_defined() {
 
 # 0 = all defined; >0 = undefined remain
 are_all_project_config_tokens_defined() {
-    grep -e '__' ${PROJECT_CONFIG_FILE} | wc -l | awk '{ print $1 }'
+    if [[ -f ${PROJECT_CONFIG_FILE} ]]; then
+        grep -e '__' ${PROJECT_CONFIG_FILE} | wc -l | awk '{ print $1 }'
+    fi
 }
 
 
