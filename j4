@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+
+CWD="$(pwd)"
+P4="p4"
+SCRIPT_NAME="$(basename $0)"
+
+USER_CONFIG_DIR="${HOME}/.j4.d"
+USER_CONFIG_FILE="${USER_CONFIG_DIR}/config"
+USER_CLIENTSPEC="${USER_CONFIG_DIR}/clientspec"
+
+PROJECT_CONFIG_DIR="$(pwd)"
+PROJECT_CONFIG_FILE="${PROJECT_CONFIG_DIR}/.p4config"
+
+TMPFILE="/tmp/${SCRIPT_NAME}.$$"
+TMPCONFIG="/tmp/${SCRIPT_NAME}.config.$$"
+TMPBEFORE="/tmp/${SCRIPT_NAME}.before.$$"
+TMPSED="/tmp/${SCRIPT_NAME}.sed.$$"
+
+
+usage() {
+    cat - <<END_OF_USAGE
+
+Usage: ${SCRIPT_NAME}: {task} [KEY=VALUE...]
+
+tasks:
+
+init   - creates default configuration file:
+         ${USER_CONFIG_FILE}
+
+         This config file contains defaults that are copied and templated in the project config file.
+
+         $ ${SCRIPT_NAME} init [KEY=VALUE...]
+
+         ${USER_CONFIG_FILE} contains:
+         KEY=VALUE
+
+         The tool also creates an editable Perforce client spec template:
+         ${USER_CLIENTSPEC}
+
+         This template is intended to be edited and use __KEY__ tokens
+         to be substituted at config time.
+
+         IMPORTANT: P4PORT is a required KEY/VALUE, p4:1666 is the Perforce default, but your system may vary.
+
+config - creates local project SCM config file: ${PROJECT_CONFIG_FILE}
+
+         $ ${SCRIPT_NAME} config [KEY=VALUE...]
+
+         .p4config contains:
+         {values from config file starting with P4}
+
+         Perforce client spec created from template seeded with values
+         in config and command line tokens
+
+display     - displays current configuration
+verify      - verify all tokens are substituted in project config file
+
+clean       - removes local project config
+cleanclient - removes Perforce client based on local project config
+cleaninit   - removes user config dir: ${USER_CONFIG_DIR}
+
+END_OF_USAGE
+}
+
+warn() {
+    message=$1
+    echo "WARNING: ${message}"
+}
+
+error() {
+    message=$1
+    display_usage=$2
+    rc=$3
+    echo "ERROR: ${message}"
+
+    if [[ ${display_usage} = 1 ]]; then
+        usage
+    fi
+
+    exit ${rc}
+}
+
+
+#####################
+# IS_P4PORT_DEFINED #
+#####################
+
+# 0 = defined; 1 = undefined
+is_p4port_defined() {
+    grep -e '^P4PORT=' ${USER_CONFIG_FILE} | grep -q -v -e '__'; echo $?
+}
+
+
+#########################################
+# ARE_ALL_PROJECT_CONFIG_TOKENS_DEFINED #
+#########################################
+
+# 0 = all defined; >0 = undefined remain
+are_all_project_config_tokens_defined() {
+    grep -e '__' ${PROJECT_CONFIG_FILE} | wc -l | awk '{ print $1 }'
+}
+
+
+########
+# INIT #
+########
+
+process_init_default_config() {
+    cat > "${USER_CONFIG_FILE}" <<EOF
+P4USER=$(whoami)
+P4CLIENT=__P4USER__
+P4PORT=__REQUIRED__
+VIEWDEPOTPATH=//depot/...
+VIEWCLIENTPATH=//__P4CLIENT__/...
+EOF
+}
+
+process_init_default_template() {
+    cat > "${USER_CLIENTSPEC}" <<EOF
+Client:	__P4CLIENT__
+Owner:	__P4USER__
+Root:	__CWD__
+Options:	noallwrite noclobber compress unlocked nomodtime rmdir
+SubmitOptions:	revertunchanged
+LineEnd:	local
+View:
+	__VIEWDEPOTPATH__ __VIEWCLIENTPATH__
+EOF
+}
+
+process_init() {
+    local args=$@
+
+    [[ -f "${TMPFILE}" ]] && rm -f "${TMPFILE}"
+    [[ -f "${TMPCONFIG}" ]] && rm -f "${TMPCONFIG}"
+    [[ ! -d "${USER_CONFIG_DIR}" ]] && mkdir -p "${USER_CONFIG_DIR}"
+    [[ ! -f "${USER_CONFIG_FILE}" ]] && process_init_default_config
+    [[ -f "${USER_CONFIG_FILE}" ]] && cp "${USER_CONFIG_FILE}" "${TMPCONFIG}"
+
+    for arg in $args; do
+        key="$(echo $arg | awk -F= '{ print $1 }')"
+        grep -v -e "${key}=" "${TMPCONFIG}" > "${TMPFILE}"
+        mv "${TMPFILE}" "${TMPCONFIG}"
+        echo "${arg}" >> "${TMPCONFIG}"
+    done
+
+    sort -u "${TMPCONFIG}" > "${USER_CONFIG_FILE}"
+    rm -f "${TMPCONFIG}"
+
+    [[ ! -f "${USER_CLIENTSPEC}" ]] && process_init_default_template
+
+    [[ $(is_p4port_defined) -eq 1 ]] && error "P4PORT undefined in user config file: ${USER_CONFIG_FILE}"
+}
+
+
+#########
+# CLEAN #
+#########
+
+process_clean() {
+    [[ -f "${PROJECT_CONFIG_FILE}" ]] && rm -f "${PROJECT_CONFIG_FILE}"
+}
+
+
+###############
+# CLEANCLIENT #
+###############
+
+process_cleanclient() {
+    clientname="$(grep P4CLIENT "${PROJECT_CONFIG_FILE}" | sed 's!P4CLIENT=!!')"
+    ${P4} client -d -f ${clientname}
+}
+
+
+#############
+# CLEANINIT #
+#############
+
+process_cleaninit() {
+    [[ -d "${USER_CONFIG_DIR}" ]] && rm -fr "${USER_CONFIG_DIR}"
+}
+
+
+##########
+# CONFIG #
+##########
+
+process_config() {
+    local args=$@
+
+    [[ $(is_p4port_defined) -eq 1 ]] && error "P4PORT undefined in user config file: ${USER_CONFIG_FILE}"
+
+    # Cleanup tmp files
+    [[ -f "${TMPCONFIG}" ]] && rm -f "${TMPCONFIG}"
+    [[ -f "${TMPFILE}" ]] && rm -f "${TMPFILE}"
+    [[ -f "${TMPSED}" ]] && rm -f "${TMPSED}"
+
+    # Seed config file from user config
+    cp "${USER_CONFIG_FILE}" "${TMPCONFIG}"
+    echo "CWD=${CWD}" >> "${TMPCONFIG}"
+
+    # Add additional KV from command line
+    for arg in $args; do
+        echo "${arg}" >> "${TMPCONFIG}"
+    done
+
+    # Create tmp p4config
+    grep "^P4" "${TMPCONFIG}" > "${TMPFILE}"
+
+    # Run sed against p4config to dereference all values
+    for line in $(cat "${TMPCONFIG}"); do
+        key="$(echo $line | awk -F= '{ print $1 }')"
+        value="$(echo $line | awk -F= '{ print $2 }')"
+        echo "sed -i -e 's!__${key}__!${value}!g' ${TMPFILE}" >> "${TMPSED}"
+    done
+    chmod +x "${TMPSED}"
+
+    # Process tmp p4config
+    cp -f "${TMPCONFIG}" "${TMPBEFORE}"
+    "${TMPSED}"
+    while [[ $(diff -q "${TMPCONFIG}" "${TMPBEFORE}" > /dev/null) -eq 1 ]]; do
+        cp -f "${TMPCONFIG}" "${TMPBEFORE}"
+        "${TMPSED}"
+    done
+
+    # Move tmp p4config to project
+    mv -f "${TMPFILE}" "${PROJECT_CONFIG_FILE}"
+
+    # Create tmp clientspec
+    cp "${USER_CLIENTSPEC}" "${TMPFILE}"
+
+    # Process tmp clientspec
+    "${TMPSED}"
+    "${TMPSED}"
+
+    ${P4} client -i < "${TMPFILE}"
+
+    # Cleanup tmp files
+    [[ -f "${TMPBEFORE}" ]] && rm -f "${TMPBEFORE}"
+    [[ -f "${TMPCONFIG}" ]] && rm -f "${TMPCONFIG}"
+    [[ -f "${TMPFILE}" ]] && rm -f "${TMPFILE}"
+    [[ -f "${TMPSED}" ]] && rm -f "${TMPSED}"
+
+    if [[ $(are_all_project_config_tokens_defined) -ne 0 ]]; then
+        warn "Undefined tokens in project config file: ${PROJECT_CONFIG_FILE}"
+        grep -e '__' ${PROJECT_CONFIG_FILE} | sed 's!^!    !'
+        echo ""
+    fi
+}
+
+
+###########
+# DISPLAY #
+###########
+process_display() {
+    if [[ -f "${USER_CONFIG_FILE}" ]]; then
+        echo "*** User Config: ${USER_CONFIG_FILE}"
+        cat "${USER_CONFIG_FILE}"
+        echo ""
+    fi
+
+    if [[ -f "${USER_CLIENTSPEC}" ]]; then
+        echo "*** User Client Spec: ${USER_CLIENTSPEC}"
+        cat "${USER_CLIENTSPEC}"
+        echo ""
+    fi
+
+    if [[ -f "${PROJECT_CONFIG_FILE}" ]]; then
+        echo "*** Project Config: ${PROJECT_CONFIG_FILE}"
+        cat "${PROJECT_CONFIG_FILE}"
+        echo ""
+
+        ${P4} client -o | grep -v -e '^#' -e '^$'
+    fi
+}
+
+
+##########
+# VERIFY #
+##########
+process_verify() {
+    [[ $(are_all_project_config_tokens_defined) -ne 0 ]] && error "Undefined tokens in project config file: ${PROJECT_CONFIG_FILE}" 0
+}
+
+
+###########
+# PROCESS #
+###########
+
+process() {
+    task=$1
+    shift
+
+    case "${task}" in
+        clean)
+            process_clean
+            ;;
+        cleanclient)
+            process_cleanclient
+            ;;
+        cleaninit)
+            process_cleaninit
+            ;;
+        config)
+            process_config $@
+            ;;
+        display)
+            process_display
+            ;;
+        verify)
+            process_verify
+            ;;
+        init)
+            process_init $@
+            ;;
+        *)
+            error "unknown task \"${task}\"" 1 1
+            ;;
+    esac
+}
+
+main() {
+    process "$@"
+}
+
+main "$@"
